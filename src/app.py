@@ -7,24 +7,71 @@ for extracurricular activities at Mergington High School.
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os
 from pathlib import Path
 from pymongo import MongoClient
 from typing import Dict, Any
 
-# Initialize MongoDB connection
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-
+# Initialize FastAPI app
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
 
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+# Add cache control headers
+@app.middleware("http")
+async def add_cache_control_header(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+# Initialize MongoDB connection
+client = None
+db = None
+activities_collection = None
+
+@app.on_event("startup")
+async def startup_db_client():
+    global client, db, activities_collection
+    try:
+        print("Connecting to MongoDB...")
+        client = MongoClient('mongodb://localhost:27017/', serverSelectionTimeoutMS=5000)
+        # Force a connection to verify it works
+        client.admin.command('ping')
+        print("Successfully connected to MongoDB")
+        
+        db = client['mergington_high']
+        activities_collection = db['activities']
+        
+        # Initialize database with data if empty
+        count = activities_collection.count_documents({})
+        print(f"Found {count} existing activities")
+        
+        if count == 0:
+            print("Initializing database with initial activities...")
+            for name, activity in initial_activities.items():
+                activities_collection.insert_one({"name": name, **activity})
+            print(f"Initialized database with {len(initial_activities)} activities")
+    except Exception as e:
+        print(f"Failed to initialize MongoDB: {str(e)}")
+        raise
+
 # Mount the static files directory
 current_dir = Path(__file__).parent
-app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
-          "static")), name="static")
+static_path = os.path.join(current_dir, "static")
+print(f"Mounting static files from: {static_path}")
+app.mount("/static", StaticFiles(directory=static_path, html=True), name="static")
 
 # Initial activities data
 initial_activities = {
@@ -84,26 +131,55 @@ initial_activities = {
     }
 }
 
-# Initialize database with activities if empty
-if activities_collection.count_documents({}) == 0:
-    for name, activity in initial_activities.items():
-        activities_collection.insert_one({"name": name, **activity})
-
-
 @app.get("/")
 def root():
-    return RedirectResponse(url="/static/index.html")
+    return FileResponse(os.path.join(current_dir, "static", "index.html"))
 
 
 @app.get("/activities")
 def get_activities():
-    # Convert MongoDB cursor to dictionary with activity name as key
-    activities_dict = {}
-    for activity in activities_collection.find():
-        name = activity.pop('name')
-        activity.pop('_id')  # Remove MongoDB _id field
-        activities_dict[name] = activity
-    return activities_dict
+    try:
+        print("\n=== Fetching Activities ===")
+        print("Request received for activities")
+        
+        if activities_collection is None:
+            print("Error: activities_collection is None")
+            raise HTTPException(status_code=500, detail="Database not initialized")
+            
+        print("Database connection verified")
+        activities_dict = {}
+        
+        try:
+            # Test MongoDB connection
+            client.admin.command('ping')
+            print("MongoDB connection test successful")
+            
+            # Count documents
+            count = activities_collection.count_documents({})
+            print(f"Found {count} documents in collection")
+            
+            # Fetch all activities
+            cursor = activities_collection.find()
+            for activity in cursor:
+                name = activity.pop('name')
+                activity.pop('_id')  # Remove MongoDB _id field
+                activities_dict[name] = activity
+                print(f"Processed activity: {name}")
+            
+            print(f"Successfully processed {len(activities_dict)} activities")
+            return activities_dict
+            
+        except Exception as db_error:
+            error_msg = f"Database operation error: {str(db_error)}"
+            print(error_msg)
+            print(f"Error type: {type(db_error)}")
+            raise HTTPException(status_code=500, detail=error_msg)
+            
+    except Exception as e:
+        error_msg = f"Error fetching activities: {str(e)}"
+        print(error_msg)
+        print(f"Error type: {type(e)}")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 @app.post("/activities/{activity_name}/signup")
